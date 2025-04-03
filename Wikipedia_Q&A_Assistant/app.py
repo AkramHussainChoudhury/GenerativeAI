@@ -15,15 +15,34 @@ import streamlit as st
 
 load_dotenv()
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+FAISS_DIR="faiss_indices"
+bm25_dir = "bm25_indices"
+os.makedirs(FAISS_DIR, exist_ok=True)
+os.makedirs(bm25_dir, exist_ok=True)
 
 st.title("📚 AI-Powered Wikipedia QA System")
-st.write("Enter your question below to get an AI-powered response.")
+#st.write("Enter your question below to get an AI-powered response.")
+
+
+
+def load_model(model_name):
+    """Loads the appropriate Gemini model."""
+    try:
+        if model_name=="gemini-1.5-pro":
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro")
+        else:
+            llm=ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+
+        return llm
+    except Exception as e:
+        print(f"❌ Error loading LLM model: {e}")
+        return None
 
 def save_bm25_docs(wiki_title, chunks):
     """Saves BM25 documents locally to avoid re-fetching Wikipedia data"""
     bm25_data = [{"title": wiki_title, "content": chunk} for chunk in chunks]
-
-    with open("bm25_docs.json", "w", encoding="utf-8") as f:
+    file_path = os.path.join(bm25_dir, f"{wiki_title}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
         json.dump(bm25_data, f, ensure_ascii=False, indent=4)
 
 def getWikipediaContent(title):
@@ -64,8 +83,11 @@ def ingestData(wiki_title):
                 return f"Error:{response.status_code}"
 
 
-
         wiki_data = getWikipediaContent(wiki_title)
+        if "Error" in wiki_data:
+            st.error(f"Failed to fetch Wikipedia content for '{wiki_title}'")
+            return
+
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_text(wiki_data)
         docs = [Document(page_content=chunk, metadata={"title": wiki_title}) for chunk in chunks]
@@ -75,93 +97,91 @@ def ingestData(wiki_title):
 
         # Create FAISS Vector Store from Documents
         faiss_index = FAISS.from_documents(docs, embeddings)
-
         # Save for future use
-        faiss_index.save_local("wikipedia_faiss_index")
+        index_path = os.path.join(FAISS_DIR, wiki_title)
+        faiss_index.save_local(index_path)
     except Exception as e :
+        os.remove(os.path.join(FAISS_DIR, wiki_title))  # Remove partial FAISS index
+        os.remove(os.path.join(bm25_dir, f"{wiki_title}.json"))  # Remove partial BM25 file
         print(f"❌ Error during ingestion: {e}")
 
 
-
-
-def load_model(model_name):
-    """Loads the appropriate Gemini model."""
-    try:
-        if model_name=="gemini-1.5-pro":
-            llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro")
-        else:
-            llm=ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-
-        return llm
-    except Exception as e:
-        print(f"❌ Error loading LLM model: {e}")
-        return None
-
-
-def load_bm25_docs(wiki_title):
+def load_bm25_docs():
     """Loads BM25 documents from local storage"""
-    try:
-        if os.path.exists("bm25_docs.json"):
-            with open("bm25_docs.json", "r", encoding="utf-8") as f:
+    bm25_docs = []
+    if not os.path.exists(bm25_dir):
+        return []
+    for file_name in os.listdir(bm25_dir):
+        file_path = os.path.join(bm25_dir, file_name)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return [Document(page_content=item["content"], metadata={"title": item["title"]}) for item in data]
-        print("BM25 documents not found. Re-ingesting data...")
-        ingestData(wiki_title)  # Re-fetch Wikipedia content & save BM25 data
-        return load_bm25_docs(wiki_title)  # Load again after ingestion
-    except Exception as e:
-        print(f"❌ Error loading BM25 documents: {e}")
-        return None
+                bm25_docs.extend([Document(page_content=item["content"], metadata={"title": item["title"]}) for item in data])
+            #print("BM25 documents not found. Re-ingesting data...")
+            #ingestData(wiki_title)  # Re-fetch Wikipedia content & save BM25 data
+            #return load_bm25_docs(wiki_title)  # Load again after ingestion
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load BM25 index '{file_name}': {e}")
+    return bm25_docs
 
-def faiss_index_exists():
-    return os.path.exists("wikipedia_faiss_index/index.faiss") and os.path.exists("wikipedia_faiss_index/index.pkl")
+def load_faiss_indexes():
+    """Loads all available FAISS indexes"""
+    retrievers=[]
+    for index_name in os.listdir(FAISS_DIR):
+        index_path = os.path.join(FAISS_DIR,index_name)
+        try:
+            faiss_index = FAISS.load_local(index_path, embeddings,allow_dangerous_deserialization=True)
+            retrievers.append(faiss_index.as_retriever(search_type="similarity"))
+        except Exception as e:
+            st.warning(f"failed to load FAISS index '{index_name}':{e}")
+
+    return retrievers
 
 
-wiki_title = "Indian_independence_movement"
-
-
-if not faiss_index_exists():
-    ingestData(wiki_title)
-
-
-faiss_index = FAISS.load_local("wikipedia_faiss_index", embeddings,allow_dangerous_deserialization=True)
+# Load all retrievers at startup
+bm25_docs = load_bm25_docs()
+faiss_retrievers = load_faiss_indexes()
+bm25_retriever = BM25Retriever.from_documents(bm25_docs) if bm25_docs else None
 
 # Create retriever
-vectorstore_retreiver = faiss_index.as_retriever(search_type="similarity")
-
-bm25_docs = load_bm25_docs(wiki_title)
-keyword_retriever = BM25Retriever.from_documents(bm25_docs)
-keyword_retriever.k = 5
-
-
+retrievers = load_faiss_indexes()
 llm = load_model("gemini-1.5-pro")
-normal_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever = vectorstore_retreiver
-)
 
 
-ensemble_retriever =EnsembleRetriever(retrievers=[vectorstore_retreiver,keyword_retriever],weights=[0.5,0.5])
+if faiss_retrievers or bm25_retriever:
+    retriever_list = [*faiss_retrievers]  # Add FAISS retrievers first
+    if bm25_retriever:
+        retriever_list.append(bm25_retriever)  # Add BM25 if available
 
-question = st.text_input("Ask a question:")
-
-if question:
-    if llm  and ensemble_retriever:
-        try:
-            ensemblel_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever = ensemble_retriever
-            )
-
-            print("getting ensemble answer")
-            response = ensemblel_chain.invoke(question)
-
-            answer= response.get("result","No response received")
-            st.success("✅ AI Answer:")
-            st.write(answer)
-
-        except Exception as e:
-            print(f"❌ Error during question-answering: {e}")
+    # Ensure retriever_list is not empty before creating ensemble
+    if retriever_list:
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=retriever_list,
+            weights=[1 / len(retriever_list)] * len(retriever_list)
+        )
     else:
-        st.error("⚠️ Model or retriever is not properly initialized.")
+        ensemble_retriever = None  # No retrievers available
+else:
+    ensemble_retriever = None  # No retrievers available
+
+
+# UI for adding new topics
+topic_input = st.text_input("Enter a Wikipedia topic to ingest (optional):")
+if st.button("Ingest Topic") and topic_input:
+    ingestData(topic_input)
+    st.success(f"Ingested data for {topic_input}")
+
+
+
+# UI for asking questions
+query = st.text_input("Ask a question:")
+if st.button("Search") and query:
+    ensemble_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=ensemble_retriever
+    )
+    response = ensemble_chain.invoke(query)
+    answer = response.get("result", "No response received")
+    st.success("✅ AI Answer:")
+    st.write(answer)
