@@ -26,7 +26,7 @@ RAG_Project/
 │── myenv/               # Virtual environment (Python dependencies)
 │── faiss_indices/       # Stores FAISS vector indexes
 │── bm25_indices/        # Stores BM25 JSON indexes
-│── main.py              # Main application script
+│── app.py              # Main application script
 │── requirements.txt     # Required dependencies
 │── README.md            # Project documentation
 
