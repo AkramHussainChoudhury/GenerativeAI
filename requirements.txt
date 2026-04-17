@@ -1,0 +1,11 @@
+python-dotenv
+langchain-core
+langchain-google-genai
+langchain_groq
+langgraph
+playwright
+greenlet==3.2.4
+ddgs
+pydantic
+typing-extensions
+resend
